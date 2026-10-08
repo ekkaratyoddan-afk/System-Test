@@ -5,9 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>IDC3 Master Infrastructure Dashboard & Editor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<!-- Include jsOTP library for secure 2FA TOTP verification -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jsSHA/3.3.1/sha.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/jsotp@1.0.6/lib/jsotp.min.js"></script>
 <style>
   :root{
     --bg:#f4f6f9; --card:#ffffff; --txt:#2d3748; --muted:#718096;
@@ -399,13 +396,106 @@
   </div>
 </div>
 
-<footer>IDC3 Master Infrastructure Dashboard & Editor — ระบบยืนยัน 2FA แม่นยำ v36</footer>
+<footer>IDC3 Master Infrastructure Dashboard & Editor — ระบบยืนยัน 2FA แม่นยำ v37</footer>
 
 <script>
   let loadChartInstance = null;
 
-  /* ---------- LOGIN & SECURE TOTP 2FA AUTHENTICATOR ---------- */
+  /* ---------- PURE JS SECURE TOTP 2FA AUTHENTICATOR ---------- */
   const SECRET_KEY = "JBSWY3DPEHPK3PXP";
+
+  // Base32 Decoder function for standard TOTP
+  function base32ToBytes(base32) {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let bits = "";
+    let hex = "";
+    for (let i = 0; i < base32.length; i++) {
+      let val = alphabet.indexOf(base32.charAt(i).toUpperCase());
+      if (val === -1) continue;
+      bits += val.toString(2).padStart(5, '0');
+    }
+    for (let i = 0; i + 8 <= bits.length; i += 8) {
+      let chunk = bits.substr(i, 8);
+      hex += parseInt(chunk, 2).toString(16).padStart(2, '0');
+    }
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < hex.length; i += 2) {
+      bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+    }
+    return bytes;
+  }
+
+  async function hmacSha1(keyBytes, messageBytes) {
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw", keyBytes, { name: "HMAC", hash: { name: "SHA-1" } }, false, ["sign"]
+    );
+    const signature = await crypto.subtle.sign("HMAC", cryptoKey, messageBytes);
+    return new Uint8Array(signature);
+  }
+
+  async function generateTOTP(secret, timeStep = 30) {
+    try {
+      const keyBytes = base32ToBytes(secret);
+      const epoch = Math.floor(Date.now() / 1000);
+      const counter = Math.floor(epoch / timeStep);
+      
+      const message = new Uint8Array(8);
+      let tempCounter = counter;
+      for (let i = 7; i >= 0; i--) {
+        message[i] = tempCounter & 0xff;
+        tempCounter = Math.floor(tempCounter / 256);
+      }
+
+      const hmac = await hmacSha1(keyBytes, message);
+      const offset = hmac[hmac.length - 1] & 0x0f;
+      const binary =
+        ((hmac[offset] & 0x7f) << 24) |
+        ((hmac[offset + 1] & 0xff) << 16) |
+        ((hmac[offset + 2] & 0xff) << 8) |
+        (hmac[offset + 3] & 0xff);
+      
+      const otp = binary % 1000000;
+      return otp.toString().padStart(6, '0');
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function verifyTOTP(token) {
+    if (!token || token.length !== 6) return false;
+    // ตรวจสอบย้อนหลังและล่วงหน้า 1 ช่วงเวลา (±30 วินาที) เพื่อป้องกันปัญหาเวลาเครื่องเคลื่อน
+    const timeSteps = [-1, 0, 1];
+    const epoch = Math.floor(Date.now() / 1000);
+    
+    for (let offset of timeSteps) {
+      const targetTime = epoch + (offset * 30);
+      const keyBytes = base32ToBytes(SECRET_KEY);
+      const counter = Math.floor(targetTime / 30);
+      
+      const message = new Uint8Array(8);
+      let tempCounter = counter;
+      for (let i = 7; i >= 0; i--) {
+        message[i] = tempCounter & 0xff;
+        tempCounter = Math.floor(tempCounter / 256);
+      }
+      
+      try {
+        const hmac = await hmacSha1(keyBytes, message);
+        const codeOffset = hmac[hmac.length - 1] & 0x0f;
+        const binary =
+          ((hmac[codeOffset] & 0x7f) << 24) |
+          ((hmac[codeOffset + 1] & 0xff) << 16) |
+          ((hmac[codeOffset + 2] & 0xff) << 8) |
+          (hmac[codeOffset + 3] & 0xff);
+        const generatedOtp = (binary % 1000000).toString().padStart(6, '0');
+        
+        if (generatedOtp === token) return true;
+      } catch (err) {
+        continue;
+      }
+    }
+    return false;
+  }
 
   function handleStep1() {
     const u = document.getElementById('userInput').value;
@@ -420,26 +510,14 @@
     }
   }
 
-  function handleStep2() {
+  async function handleStep2() {
     const code = document.getElementById('authCodeInput').value.trim();
-    if(code.length !== 6 || isNaN(code)) {
-      document.getElementById('authError').style.display = 'block';
-      return;
-    }
+    const isValid = await verifyTOTP(code);
 
-    try {
-      // ตรวจสอบรหัส TOTP จาก Secret Key จริง (รองรับ window รอบปัจจุบันและรอบก่อนหน้าเพื่อความแม่นยำ)
-      const totp = new jsOTP.totp();
-      const isValid = totp.verify(SECRET_KEY, code);
-
-      if(isValid) {
-        document.getElementById('loginOverlay').style.display = 'none';
-        sessionStorage.setItem('idc3_logged_in', 'true');
-      } else {
-        document.getElementById('authError').style.display = 'block';
-      }
-    } catch(err) {
-      // Fallback ป้องกันกรณีห้องสมุดมีปัญหาขัดข้อง
+    if(isValid) {
+      document.getElementById('loginOverlay').style.display = 'none';
+      sessionStorage.setItem('idc3_logged_in', 'true');
+    } else {
       document.getElementById('authError').style.display = 'block';
     }
   }
@@ -695,7 +773,7 @@
     ]
   };
 
-  let savedData = JSON.parse(localStorage.getItem('idc3_master_db_v36'));
+  let savedData = JSON.parse(localStorage.getItem('idc3_master_db_v37'));
   let db = defaultData;
   if(savedData) {
     for(let key in defaultData) {
@@ -711,7 +789,7 @@
 
   function saveData() {
     try {
-      localStorage.setItem('idc3_master_db_v36', JSON.stringify(db));
+      localStorage.setItem('idc3_master_db_v37', JSON.stringify(db));
     } catch(e) {
       alert('พื้นที่จัดเก็บเต็ม! รูปภาพที่อัปโหลดมีขนาดใหญ่เกินไป\nแนะนำให้ใช้ลิงก์ URL รูปภาพแทนการอัปโหลดไฟล์ครับ');
     }
